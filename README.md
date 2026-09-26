@@ -2,9 +2,10 @@
 
 基于 FastAPI 的拼车费用分摊服务：按顺序路段读取整数分费用与每位乘客的上下车站点，
 逐段均摊费用，输出逐人总额与逐路段明细；还可从最多 12 名候选乘客中**自动遴选**一组
-上车（座位与预算双约束，先求入选人数最多、再求入选者应付总额最小），以及在提供每人
-实际付款记录后，自动生成**转账笔数全局最少**的结清方案。金额全程使用整数分与精确分数计算，
-总额严格守恒，且乘客与付款记录的输入顺序不影响结果。
+上车（座位与预算双约束，先求入选人数最多、再求入选者应付总额最小）；在提供每人
+实际付款记录后，自动生成**转账笔数全局最少**的结清方案；以及在路段费用修订后，
+按所有修订应用顺序计算每个变动路段对每人应付额的**平均边际影响（Shapley 归因）**。
+金额全程使用整数分与精确分数计算，总额严格守恒，且乘客与付款记录的输入顺序不影响结果。
 
 ## 快速启动
 
@@ -21,8 +22,11 @@ docker compose up --build
 | http://localhost:8000/split | 分摊接口（POST） |
 | http://localhost:8000/admit | 候选乘客遴选 + 分摊接口（POST） |
 | http://localhost:8000/settle | 分摊 + 结清转账接口（POST） |
-| http://localhost:8000/docs | Swagger 交互式文档 |
+| http://localhost:8000/revision-impact | 路段费用修订的边际影响归因接口（POST） |
+| http://localhost:8000/docs | Swagger 交互式文档（各 POST 接口可在此直接发请求） |
 | http://localhost:8000/healthz | 健康检查 |
+
+以上 `/split`、`/admit`、`/settle`、`/revision-impact` 均为 **POST** 接口，浏览器地址栏直接访问只适用于 GET；命令行可用下文的 `curl` 示例（带 `-d` 请求体即按 POST 发送），或打开 `/docs` 在页面上交互式调用。
 
 后台运行可加 `-d`；停止用 `docker compose down`。
 
@@ -207,6 +211,96 @@ curl -s http://localhost:8000/settle \
   -d '{"segments":[100,251,80],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3},{"id":"carol","board":0,"alight":1}],"payments":[{"id":"alice","amount":331},{"id":"bob","amount":100},{"id":"carol","amount":0}]}'
 ```
 
+## API：`POST /revision-impact`
+
+同一份乘客名单、同一次行程，只有部分路段的费用发生修订：给出**原始 `segments`** 与**等长的
+`revised_segments`**，接口复用 `/split` 的全部校验与「逐段累计欠额分摊」算法，输出修订前后每人
+应付额、差额，并把每人的差额**归因到每个费用发生变化的路段**。
+
+### 归因口径：所有应用顺序上的平均边际影响
+
+把 m 个变动路段逐个从原价切换为修订价。给定某个应用顺序，一条路段 j 的**边际影响**是：在它之前
+已经切换的路段集合为 S 时，先只应用 S、再应用 S∪{j}，两次全程重新分摊后每人应付额之差。
+由于欠额分摊是逐段累计的（某段余数补给谁取决于此前各段），中间状态必须对「S 用修订价、其余用
+原价」的费用数组**从头重新分摊**。对所有 m! 个应用顺序取平均，即变动 j 对每人的 Shapley 贡献：
+
+```
+contribution(j, p) = Σ_{S ⊆ 其他变动路段} |S|!·(m-1-|S|)!/m! ·
+                     (应付_p(S∪{j}) − 应付_p(S))
+```
+
+实现上枚举 2^m 个子集（最多 8 个变动，即 256 次分摊），全程精确分数（`fractions.Fraction`）：
+
+- 每个变动路段对**每位乘客**都给出一个**最简分数字符串**（整数输出为 `"3"`，真分数为 `"1/2"`）；
+- 贡献**可能为负**（例如某段降价，或余数 1 分的归属被其他路段改变），负值保留 `-` 号；
+- **逐人精确守恒**：每位乘客在所有变动路段上的贡献之和，精确等于其 `after − before` 差额；
+- 无任何路段费用变化时，`changes` 为空数组，每人差额为 0。
+
+### 请求体
+
+```json
+{
+  "segments": [100, 251, 80],
+  "revised_segments": [120, 240, 90],
+  "passengers": [
+    {"id": "alice", "board": 0, "alight": 3},
+    {"id": "bob",   "board": 1, "alight": 3},
+    {"id": "carol", "board": 0, "alight": 1}
+  ]
+}
+```
+
+- `segments` / `revised_segments`：原始与修订的逐段费用，**等长、同序**，元素均为非负整数分；
+  两份列表各自都必须满足 `/split` 的全部规则（不允许空载收费段等）。
+- `passengers`：两份费用共用的**同一份名单**（上下车区间不变，只有路段费用变）。
+- 费用发生变化（两列表同位置数值不等）的路段**不得超过 8 个**，否则返回 422。
+
+### 响应（200）
+
+```json
+{
+  "before": {"alice": 216, "bob": 165, "carol": 50},
+  "after": {"alice": 225, "bob": 165, "carol": 60},
+  "deltas": {"alice": 9, "bob": 0, "carol": 10},
+  "changes": [
+    {"index": 0, "original_cost": 100, "revised_cost": 120, "contributions": {"alice": "10", "bob": "0", "carol": "10"}},
+    {"index": 1, "original_cost": 251, "revised_cost": 240, "contributions": {"alice": "-6", "bob": "-5", "carol": "0"}},
+    {"index": 2, "original_cost": 80,  "revised_cost": 90,  "contributions": {"alice": "5",  "bob": "5", "carol": "0"}}
+  ]
+}
+```
+
+- `before` / `after`：原始 / 修订费用下每人应付额（分别等同于对两份费用调用 `/split` 的 `totals`）。
+- `deltas`：`after − before`，每人修订后的应付变化（整数分，负数表示少付）。
+- `changes[]`：每个变动路段一项，按 `index` 升序；`contributions` 给出该路段对**每位**乘客的平均
+  边际影响（最简分数字符串，负数带符号）。逐人求和恒等于其 `deltas`，例如
+  `alice: 10 + (-6) + 5 = 9`、`carol: 10 + 0 + 0 = 10`；段 1 降价使 `alice`/`bob` 的贡献为负。
+
+当余数分摊在不同应用顺序下归属不同乘客时，贡献会是真分数。下例两段费用一加一减互相抵消、
+每人总差额为 0，但每段的平均边际影响都是 ±1/2：
+
+```json
+{
+  "before": {"alice": 7, "bob": 4, "carol": 2},
+  "after": {"alice": 7, "bob": 4, "carol": 2},
+  "deltas": {"alice": 0, "bob": 0, "carol": 0},
+  "changes": [
+    {"index": 0, "original_cost": 8, "revised_cost": 9, "contributions": {"alice": "1/2", "bob": "0", "carol": "1/2"}},
+    {"index": 1, "original_cost": 5, "revised_cost": 4, "contributions": {"alice": "-1/2", "bob": "0", "carol": "-1/2"}}
+  ]
+}
+```
+
+（名单：alice 乘坐全程 2 段，bob 只坐第 0 段，carol 只坐第 1 段。）
+
+### 示例
+
+```bash
+curl -s http://localhost:8000/revision-impact \
+  -H 'Content-Type: application/json' \
+  -d '{"segments":[100,251,80],"revised_segments":[120,240,90],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3},{"id":"carol","board":0,"alight":1}]}'
+```
+
 ## 分摊规则
 
 1. 按路段顺序处理，每段找出全部在车乘客均摊：`base = cost // n`，余数 `r = cost % n`。
@@ -227,7 +321,9 @@ curl -s http://localhost:8000/settle \
 - （仅 `/admit`）`capacity` 非正整数，或 `max_fare` 为负/非整数；
 - （仅 `/settle`）`payments` 总和不等于行程总额；
 - （仅 `/settle`）`payments` 缺失某位乘客、存在未知 ID 或同一 ID 重复；
-- （仅 `/settle`）付款金额为负或非整数（如小数）。
+- （仅 `/settle`）付款金额为负或非整数（如小数）；
+- （仅 `/revision-impact`）`segments` 与 `revised_segments` 长度不等；
+- （仅 `/revision-impact`）费用发生变化的路段超过 8 个（归因需枚举全部 2^n 个子集）。
 
 ## 本地开发与测试
 
@@ -243,9 +339,9 @@ uvicorn app.main:app --reload    # 本地起服务，默认 http://127.0.0.1:800
 
 ```
 app/
-  main.py       # FastAPI 应用与路由（POST /split、POST /admit、POST /settle、GET /healthz）
+  main.py       # FastAPI 应用与路由（POST /split、/admit、/settle、/revision-impact、GET /healthz）
   models.py     # 请求/响应模型与 422 校验规则
-  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）
+  splitter.py   # 核心算法：分摊（精确分数）+ 候选遴选（子集枚举）+ 最少转账结清（子集 DP）+ 修订影响（Shapley 平均边际）
 tests/          # 算法单元测试 + API 集成测试
 Dockerfile      # 依赖与启动命令均固化在镜像内
 compose.yaml    # 单服务编排，含健康检查

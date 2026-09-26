@@ -11,7 +11,7 @@ from __future__ import annotations
 from fractions import Fraction
 from functools import lru_cache
 from itertools import combinations
-from math import gcd as _gcd
+from math import factorial, gcd as _gcd
 from typing import Dict, List, Tuple
 
 
@@ -266,6 +266,100 @@ def admit_passengers(segment_costs: List[int], passengers, candidates,
     else:
         _, details = evaluate(mask, want_details=True)
     return [ordered[j].id for j in range(n) if mask & (1 << j)], totals, details
+
+
+# --- revision impact: Shapley-style marginal effect of each changed segment
+
+
+def revision_impact(original_costs: List[int], revised_costs: List[int],
+                    passengers) -> Tuple[Dict, Dict, List[dict]]:
+    """Attribute each passenger's fare change to the changed-cost segments.
+
+    ``original_costs`` and ``revised_costs`` are two equal-length segment cost
+    lists over the *same* fixed roster ``passengers`` (the same segments /
+    passengers on board — only the money charged on some segments changes).
+
+    Think of applying the changed segments one at a time: starting from the
+    original costs, every application order is a path from the original split
+    to the revised one, and a changed segment's *marginal effect* is how much
+    every passenger's allocation moves when that segment is switched to its
+    revised cost, given the set of other changed segments already applied.
+    Because deficit allocation is sequential (a segment's leftovers depend on
+    the costs processed earlier), each intermediate subset of changes is
+    re-split from scratch with :func:`split_fares`, using the original cost
+    outside the subset and the revised cost inside it.
+
+    Averaging each changed segment's marginal effect over all application
+    orders is its Shapley contribution. For changed segment ``j`` and
+    passenger ``p``::
+
+        contribution(j, p) =
+            sum over subsets S of the *other* changed segments of
+                w(k) * (allocation_p(costs with S U {j}) - allocation_p(costs with S)),
+            k = |S|,  w(k) = k! (m - 1 - k)! / m!,  m = #changed segments.
+
+    The contributions are exact :class:`Fraction` values; they may be
+    negative (switching a segment can reduce a passenger's allocation, e.g.
+    when an odd leftover cent moves elsewhere), and for every passenger they
+    sum exactly to ``revised_total - original_total``.
+
+    Returns ``(before, after, changes)``: ``before``/``after`` map passenger
+    id (canonical order) to original/revised integer-cents totals; ``changes``
+    lists one dict per changed segment, in index order, with keys ``index``,
+    ``original_cost``, ``revised_cost`` and ``contributions`` (id -> Fraction
+    for every passenger). With no changed segments ``changes`` is empty.
+    """
+    if len(original_costs) != len(revised_costs):
+        raise ValueError("original and revised segment lists must have equal length")
+
+    changed = [i for i, (a, b) in enumerate(zip(original_costs, revised_costs)) if a != b]
+    m = len(changed)
+    ids = sorted((p.id for p in passengers), key=tie_key)
+
+    before, _ = split_fares(original_costs, passengers)
+    after, _ = split_fares(revised_costs, passengers)
+
+    changes: List[dict] = []
+    if m == 0:
+        return before, after, changes
+
+    # Totals for every subset of changed segments (bit j of the mask selects
+    # changed[j]); selected segments use their revised cost, the rest the
+    # original.
+    totals_for_mask: Dict[int, Dict] = {}
+    for mask in range(1 << m):
+        costs = list(original_costs)
+        for j, index in enumerate(changed):
+            if mask & (1 << j):
+                costs[index] = revised_costs[index]
+        totals_for_mask[mask], _ = split_fares(costs, passengers)
+
+    for j, index in enumerate(changed):
+        bit = 1 << j
+        others = ((1 << m) - 1) ^ bit
+        contributions: Dict = {pid: Fraction(0) for pid in ids}
+        sub = others
+        while True:
+            k = bin(sub).count("1")
+            weight = Fraction(
+                factorial(k) * factorial(m - 1 - k), factorial(m)
+            )
+            with_j = totals_for_mask[sub | bit]
+            without_j = totals_for_mask[sub]
+            for pid in ids:
+                contributions[pid] += weight * (with_j[pid] - without_j[pid])
+            if sub == 0:
+                break
+            sub = (sub - 1) & others
+
+        changes.append({
+            "index": index,
+            "original_cost": original_costs[index],
+            "revised_cost": revised_costs[index],
+            "contributions": contributions,
+        })
+
+    return before, after, changes
 
 
 # --- settlement: turn balances (paid - owed) into a minimal set of transfers

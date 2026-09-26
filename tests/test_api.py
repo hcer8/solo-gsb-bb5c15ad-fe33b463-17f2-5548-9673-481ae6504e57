@@ -488,5 +488,184 @@ class SettleApiTests(unittest.TestCase):
         self.assertEqual(resp.json(), {"status": "ok"})
 
 
+class RevisionImpactApiTests(unittest.TestCase):
+    REVISION_PAYLOAD = {
+        "segments": [100, 251, 80],
+        "revised_segments": [100, 252, 80],
+        "passengers": [
+            {"id": "alice", "board": 0, "alight": 3},
+            {"id": "bob", "board": 1, "alight": 3},
+            {"id": "carol", "board": 0, "alight": 1},
+        ],
+    }
+
+    def test_revision_ok_single_change(self):
+        resp = client.post("/revision-impact", json=self.REVISION_PAYLOAD)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["before"], {"alice": 216, "bob": 165, "carol": 50})
+        self.assertEqual(body["after"], {"alice": 216, "bob": 166, "carol": 50})
+        self.assertEqual(body["deltas"], {"alice": 0, "bob": 1, "carol": 0})
+        self.assertEqual(len(body["changes"]), 1)
+        change = body["changes"][0]
+        self.assertEqual(change["index"], 1)
+        self.assertEqual(change["original_cost"], 251)
+        self.assertEqual(change["revised_cost"], 252)
+        # segment 1 carries alice+bob; the extra cent follows deficit order
+        self.assertEqual(change["contributions"],
+                         {"alice": "0", "bob": "1", "carol": "0"})
+
+    def test_before_and_after_match_plain_splits(self):
+        body = client.post("/revision-impact", json=self.REVISION_PAYLOAD).json()
+        for key, costs in (("before", self.REVISION_PAYLOAD["segments"]),
+                           ("after", self.REVISION_PAYLOAD["revised_segments"])):
+            split = client.post("/split", json={
+                "segments": costs,
+                "passengers": self.REVISION_PAYLOAD["passengers"],
+            }).json()
+            self.assertEqual(body[key], split["totals"])
+
+    def test_no_changes_returns_empty_contributions_and_zero_deltas(self):
+        payload = dict(self.REVISION_PAYLOAD,
+                       revised_segments=list(self.REVISION_PAYLOAD["segments"]))
+        body = client.post("/revision-impact", json=payload).json()
+        self.assertEqual(body["before"], body["after"])
+        self.assertEqual(body["deltas"],
+                         {pid: 0 for pid in body["before"]})
+        self.assertEqual(body["changes"], [])
+
+    def test_fraction_strings_and_exact_additivity_per_passenger(self):
+        from fractions import Fraction
+        payload = {
+            "segments": [10, 7, 13],
+            "revised_segments": [11, 9, 10],
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 3},
+                {"id": "b", "board": 0, "alight": 2},
+                {"id": "c", "board": 1, "alight": 3},
+            ],
+        }
+        body = client.post("/revision-impact", json=payload).json()
+        self.assertEqual(len(body["changes"]), 3)
+        # contributions serialize as reduced fraction strings, sign kept
+        by_index = {c["index"]: c for c in body["changes"]}
+        self.assertEqual(by_index[0]["contributions"],
+                         {"a": "1/3", "b": "1/2", "c": "1/6"})
+        self.assertEqual(by_index[2]["contributions"],
+                         {"a": "-7/6", "b": "0", "c": "-11/6"})
+        # per-passenger contributions sum EXACTLY to the integer delta
+        for pid, delta in body["deltas"].items():
+            total = sum(
+                (Fraction(c["contributions"][pid]) for c in body["changes"]),
+                Fraction(0),
+            )
+            self.assertEqual(total, delta, pid)
+        # contributions cover every passenger and every changed segment
+        for change in body["changes"]:
+            self.assertEqual(set(change["contributions"]), set(body["deltas"]))
+
+    def test_negative_contribution_on_fare_decrease(self):
+        payload = {
+            "segments": [8, 8],
+            "revised_segments": [11, 7],
+            "passengers": [
+                {"id": "a", "board": 0, "alight": 2},
+                {"id": "b", "board": 1, "alight": 2},
+            ],
+        }
+        body = client.post("/revision-impact", json=payload).json()
+        self.assertEqual(body["deltas"], {"a": 3, "b": -1})
+        by_index = {c["index"]: c["contributions"] for c in body["changes"]}
+        self.assertEqual(by_index[0], {"a": "3", "b": "0"})
+        self.assertEqual(by_index[1], {"a": "0", "b": "-1"})
+
+    def test_eight_changed_segments_is_ok_nine_is_422(self):
+        passengers = [{"id": "a", "board": 0, "alight": 9}]
+        eight = client.post("/revision-impact", json={
+            "segments": [0] + [1] * 8,
+            "revised_segments": [0] + [2] * 8,
+            "passengers": passengers,
+        })
+        self.assertEqual(eight.status_code, 200, eight.text)
+        self.assertEqual(len(eight.json()["changes"]), 8)
+
+        nine = client.post("/revision-impact", json={
+            "segments": [0] * 9,
+            "revised_segments": [1] * 9,
+            "passengers": passengers,
+        })
+        self.assertEqual(nine.status_code, 422)
+        self.assertIn("at most 8 changed segments", nine.text)
+
+    def test_unequal_lengths_is_422(self):
+        payload = {
+            "segments": [10, 10],
+            "revised_segments": [10],
+            "passengers": [{"id": "a", "board": 0, "alight": 2}],
+        }
+        resp = client.post("/revision-impact", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("equal length", resp.text)
+
+    def test_split_validation_reused_for_both_lists(self):
+        # invalid interval on the shared roster
+        resp = client.post("/revision-impact", json={
+            "segments": [10], "revised_segments": [10],
+            "passengers": [{"id": "a", "board": 1, "alight": 1}],
+        })
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("invalid interval", resp.text)
+
+        # original list has an empty-load charged segment
+        resp = client.post("/revision-impact", json={
+            "segments": [10, 0], "revised_segments": [0, 0],
+            "passengers": [{"id": "a", "board": 1, "alight": 2}],
+        })
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no passengers on board", resp.text)
+
+        # revised list introduces an empty-load charged segment
+        resp = client.post("/revision-impact", json={
+            "segments": [10, 0], "revised_segments": [0, 10],
+            "passengers": [{"id": "a", "board": 0, "alight": 1}],
+        })
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no passengers on board", resp.text)
+
+    def test_duplicate_ids_negative_costs_empty_list_are_422(self):
+        base = {
+            "segments": [10, 10],
+            "revised_segments": [10, 10],
+            "passengers": [{"id": "a", "board": 0, "alight": 2}],
+        }
+        dup = dict(base, passengers=[
+            {"id": "a", "board": 0, "alight": 1},
+            {"id": "a", "board": 1, "alight": 2},
+        ])
+        self.assertEqual(client.post("/revision-impact", json=dup).status_code, 422)
+        neg = dict(base, revised_segments=[10, -1])
+        self.assertEqual(client.post("/revision-impact", json=neg).status_code, 422)
+        empty = {"segments": [], "revised_segments": [], "passengers": []}
+        self.assertEqual(client.post("/revision-impact", json=empty).status_code, 422)
+        unknown = dict(base, currency="usd")
+        self.assertEqual(client.post("/revision-impact", json=unknown).status_code, 422)
+
+    def test_input_order_does_not_matter(self):
+        import random
+        baseline = client.post(
+            "/revision-impact", json=self.REVISION_PAYLOAD
+        ).json()
+        for seed in range(5):
+            shuffled = {
+                "segments": self.REVISION_PAYLOAD["segments"],
+                "revised_segments": self.REVISION_PAYLOAD["revised_segments"],
+                "passengers": self.REVISION_PAYLOAD["passengers"][:],
+            }
+            random.Random(seed).shuffle(shuffled["passengers"])
+            resp = client.post("/revision-impact", json=shuffled)
+            self.assertEqual(resp.status_code, 200, resp.text)
+            self.assertEqual(resp.json(), baseline)
+
+
 if __name__ == "__main__":
     unittest.main()

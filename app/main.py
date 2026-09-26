@@ -7,6 +7,9 @@ from fastapi import FastAPI
 from .models import (
     AdmitRequest,
     AdmitResponse,
+    RevisionImpactRequest,
+    RevisionImpactResponse,
+    SegmentContribution,
     SegmentSplit,
     SettleRequest,
     SettleResponse,
@@ -14,7 +17,12 @@ from .models import (
     SplitResponse,
     Transfer,
 )
-from .splitter import admit_passengers, settle_balances, split_fares
+from .splitter import (
+    admit_passengers,
+    revision_impact as compute_revision_impact,
+    settle_balances,
+    split_fares,
+)
 
 app = FastAPI(
     title="Carpool Fare Splitter",
@@ -109,5 +117,37 @@ def admit(request: AdmitRequest) -> AdmitResponse:
                 shares={str(pid): amount for pid, amount in d["shares"].items()},
             )
             for d in details
+        ],
+    )
+
+
+@app.post(
+    "/revision-impact",
+    response_model=RevisionImpactResponse,
+    responses={422: {"description": "Invalid trip or revision (bad interval, "
+                                     "out-of-range station, duplicate id, "
+                                     "empty-load charged segment in either "
+                                     "cost list, unequal-length segment lists, "
+                                     "more than 8 changed segments, malformed "
+                                     "payload, ...)"}},
+)
+def revision_impact(request: RevisionImpactRequest) -> RevisionImpactResponse:
+    before, after, changes = compute_revision_impact(
+        request.segments, request.revised_segments, request.passengers
+    )
+    return RevisionImpactResponse(
+        before={str(pid): amount for pid, amount in before.items()},
+        after={str(pid): amount for pid, amount in after.items()},
+        deltas={str(pid): after[pid] - before[pid] for pid in before},
+        changes=[
+            SegmentContribution(
+                index=c["index"],
+                original_cost=c["original_cost"],
+                revised_cost=c["revised_cost"],
+                contributions={
+                    str(pid): str(value) for pid, value in c["contributions"].items()
+                },
+            )
+            for c in changes
         ],
     )

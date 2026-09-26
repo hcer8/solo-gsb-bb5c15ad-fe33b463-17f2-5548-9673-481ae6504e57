@@ -258,3 +258,76 @@ class AdmitResponse(BaseModel):
     segments: List[SegmentSplit] = Field(
         description="per-segment split detail of the resulting trip"
     )
+
+
+class RevisionImpactRequest(BaseModel):
+    """Two equal-length cost lists for one fixed roster (a fare revision)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    segments: List[NonNegativeInt] = Field(
+        min_length=1,
+        description="original integer cost of each segment in cents, in travel order",
+    )
+    revised_segments: List[NonNegativeInt] = Field(
+        min_length=1,
+        description="revised integer cost of each segment in cents; same length "
+                    "and order as `segments`, only some values may differ",
+    )
+    passengers: List[Passenger] = Field(
+        default_factory=list,
+        description="the same passenger roster for both versions of the trip",
+    )
+
+    @model_validator(mode="after")
+    def _check_revision(self) -> "RevisionImpactRequest":
+        n = len(self.segments)
+        if len(self.revised_segments) != n:
+            raise ValueError(
+                f"segments and revised_segments must have equal length "
+                f"({n} vs {len(self.revised_segments)})"
+            )
+        _validate_roster(n, self.passengers)
+        # Both versions must be splittable: neither may charge a fare on a
+        # segment with no passengers on board.
+        _validate_charged_segments(self.segments, self.passengers)
+        _validate_charged_segments(self.revised_segments, self.passengers)
+        changed = sum(a != b for a, b in zip(self.segments, self.revised_segments))
+        if changed > 8:
+            raise ValueError(
+                f"{changed} segment(s) have a revised cost, but at most 8 "
+                f"changed segments are supported (the impact analysis "
+                f"enumerates all 2^n change subsets)"
+            )
+        return self
+
+
+class SegmentContribution(BaseModel):
+    """One changed segment's average marginal effect on every passenger."""
+
+    index: int = Field(description="index of the changed segment, 0-based")
+    original_cost: NonNegativeInt = Field(description="cost in cents before the revision")
+    revised_cost: NonNegativeInt = Field(description="cost in cents after the revision")
+    contributions: Dict[str, str] = Field(
+        description="exact average marginal effect on each passenger, as a "
+                    "reduced fraction string of cents (e.g. \"-1/2\", \"3\"); "
+                    "negative values keep their sign. Per passenger the "
+                    "contributions over all changed segments sum exactly to "
+                    "that passenger's delta"
+    )
+
+
+class RevisionImpactResponse(BaseModel):
+    before: Dict[str, NonNegativeInt] = Field(
+        description="cents each passenger pays under the original costs (same as /split totals)"
+    )
+    after: Dict[str, NonNegativeInt] = Field(
+        description="cents each passenger pays under the revised costs (same as /split totals)"
+    )
+    deltas: Dict[str, int] = Field(
+        description="after - before per passenger in cents; negative means the passenger pays less"
+    )
+    changes: List[SegmentContribution] = Field(
+        description="one entry per segment whose cost changed, ordered by index; "
+                    "empty when nothing changed"
+    )

@@ -6,9 +6,19 @@ as well as under pytest.
 
 import random
 import unittest
+from fractions import Fraction
+from itertools import permutations
+from math import factorial
 from types import SimpleNamespace as P
 
-from app.splitter import _triple, admit_passengers, settle_balances, split_fares
+from app.splitter import (
+    _triple,
+    admit_passengers,
+    revision_impact,
+    settle_balances,
+    split_fares,
+    tie_key,
+)
 
 
 def ride(pid, board, alight):
@@ -228,6 +238,159 @@ class AdmitPassengersTests(unittest.TestCase):
         ref_totals, ref_details = split_fares([100, 251, 80], chosen)
         self.assertEqual(totals, ref_totals)
         self.assertEqual(details, ref_details)
+
+
+class RevisionImpactTests(unittest.TestCase):
+    def _permutation_reference(self, original, revised, passengers):
+        """Brute-force reference: average marginals over all change orders."""
+        changed = [i for i, (a, b) in enumerate(zip(original, revised)) if a != b]
+        ids = sorted((p.id for p in passengers), key=tie_key)
+
+        def totals(applied):
+            costs = [
+                revised[i] if i in applied else original[i]
+                for i in range(len(original))
+            ]
+            t, _ = split_fares(costs, passengers)
+            return t
+
+        contributions = {i: {pid: Fraction(0) for pid in ids} for i in changed}
+        for order in permutations(changed):
+            applied = frozenset()
+            prev = totals(applied)
+            for i in order:
+                nxt = totals(applied | {i})
+                for pid in ids:
+                    contributions[i][pid] += Fraction(
+                        nxt[pid] - prev[pid]
+                    )
+                applied = applied | {i}
+                prev = nxt
+        n_orders = factorial(len(changed))
+        for i in changed:
+            for pid in ids:
+                contributions[i][pid] /= n_orders
+        return changed, contributions
+
+    def test_no_changes_returns_empty_contributions_and_zero_deltas(self):
+        passengers = [ride("a", 0, 2), ride("b", 1, 2)]
+        before, after, changes = revision_impact([30, 10], [30, 10], passengers)
+        self.assertEqual(changes, [])
+        self.assertEqual(before, after)
+        # segment 0: a alone pays 30; segment 1: a,b split 10 as 5/5
+        self.assertEqual(dict(before), {"a": 35, "b": 5})
+
+    def test_single_change_attributes_the_whole_delta(self):
+        # a rides both segments, b only segment 1
+        before, after, changes = revision_impact(
+            [8, 8], [11, 8], [ride("a", 0, 2), ride("b", 1, 2)]
+        )
+        self.assertEqual(dict(before), {"a": 12, "b": 4})
+        self.assertEqual(dict(after), {"a": 15, "b": 4})
+        self.assertEqual(len(changes), 1)
+        change = changes[0]
+        self.assertEqual(change["index"], 0)
+        self.assertEqual(change["original_cost"], 8)
+        self.assertEqual(change["revised_cost"], 11)
+        self.assertEqual(change["contributions"], {"a": Fraction(3), "b": Fraction(0)})
+
+    def test_shapley_half_share_example(self):
+        # [8,5] -> [9,4]: a rides both segments, b segment 0, c segment 1.
+        # Each segment's +/-1 cent lands on different passengers depending on
+        # application order, so every average marginal effect is +/-1/2; the
+        # two revisions cancel out and every net delta is zero.
+        passengers = [ride("a", 0, 2), ride("b", 0, 1), ride("c", 1, 2)]
+        before, after, changes = revision_impact([8, 5], [9, 4], passengers)
+        self.assertEqual(dict(before), {"a": 7, "b": 4, "c": 2})
+        self.assertEqual(dict(after), {"a": 7, "b": 4, "c": 2})
+        by_index = {c["index"]: c["contributions"] for c in changes}
+        half = Fraction(1, 2)
+        self.assertEqual(by_index[0], {"a": half, "b": Fraction(0), "c": half})
+        self.assertEqual(by_index[1], {"a": -half, "b": Fraction(0), "c": -half})
+        for pid in before:
+            self.assertEqual(
+                sum(c["contributions"][pid] for c in changes),
+                after[pid] - before[pid],
+            )
+
+    def test_negative_contribution_keeps_sign_but_additivity_holds(self):
+        # [8,8] -> [11,7], a rides both segments, b only segment 1. Segment 1
+        # drops by 1 and b rides it alone, so the whole drop is attributed to
+        # b (-1); segment 0's +3 goes entirely to a. Contributions can be
+        # negative even though the trip still costs more overall.
+        before, after, changes = revision_impact(
+            [8, 8], [11, 7], [ride("a", 0, 2), ride("b", 1, 2)]
+        )
+        self.assertEqual(dict(before), {"a": 12, "b": 4})
+        self.assertEqual(dict(after), {"a": 15, "b": 3})
+        by_index = {c["index"]: c["contributions"] for c in changes}
+        self.assertEqual(by_index[0], {"a": Fraction(3), "b": Fraction(0)})
+        self.assertEqual(by_index[1], {"a": Fraction(0), "b": Fraction(-1)})
+        for pid in before:
+            total = sum(c["contributions"][pid] for c in changes)
+            self.assertEqual(total, after[pid] - before[pid])
+
+    def test_matches_brute_force_permutation_average(self):
+        passengers = [
+            ride("a", 0, 3), ride("b", 0, 2), ride("c", 1, 3),
+        ]
+        original, revised = [10, 7, 13], [11, 9, 10]
+        changed, expected = self._permutation_reference(
+            original, revised, passengers
+        )
+        before, after, changes = revision_impact(original, revised, passengers)
+        self.assertEqual([c["index"] for c in changes], changed)
+        for change in changes:
+            for pid, value in change["contributions"].items():
+                self.assertEqual(value, expected[change["index"]][pid])
+
+    def test_contributions_exactly_reconstruct_every_delta(self):
+        rng = random.Random(20260926)
+        for _ in range(300):
+            n_seg = rng.randint(1, 6)
+            passengers = [ride("anchor", 0, n_seg)]
+            for i in range(rng.randint(0, 4)):
+                b0 = rng.randint(0, n_seg - 1)
+                passengers.append(
+                    ride(f"p{i}", b0, rng.randint(b0 + 1, n_seg))
+                )
+            original = [rng.randint(0, 60) for _ in range(n_seg)]
+            revised = list(original)
+            for i in rng.sample(range(n_seg), rng.randint(0, n_seg)):
+                revised[i] = rng.randint(0, 60)
+
+            before, after, changes = revision_impact(
+                original, revised, passengers
+            )
+            # before/after agree with a plain split of each cost list
+            self.assertEqual(dict(before), dict(split_fares(original, passengers)[0]))
+            self.assertEqual(dict(after), dict(split_fares(revised, passengers)[0]))
+            # sum of per-segment contributions is exactly the integer delta
+            for pid in before:
+                total = sum(
+                    (c["contributions"][pid] for c in changes), Fraction(0)
+                )
+                self.assertEqual(total, after[pid] - before[pid], pid)
+            # money conservation: deltas over passengers equal the fare delta
+            self.assertEqual(
+                sum(after.values()) - sum(before.values()),
+                sum(revised) - sum(original),
+            )
+
+    def test_input_order_does_not_matter(self):
+        passengers = [ride("a", 0, 3), ride("b", 1, 3), ride("c", 0, 1)]
+        original, revised = [100, 251, 80], [120, 240, 90]
+        baseline = revision_impact(original, revised, passengers)
+        for seed in range(6):
+            shuffled = passengers[:]
+            random.Random(seed).shuffle(shuffled)
+            self.assertEqual(
+                revision_impact(original, revised, shuffled), baseline
+            )
+
+    def test_unequal_lengths_rejected(self):
+        with self.assertRaises(ValueError):
+            revision_impact([1, 2], [1], [ride("a", 0, 2)])
 
 
 class SettleBalancesTests(unittest.TestCase):
