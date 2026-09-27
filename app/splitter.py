@@ -86,6 +86,91 @@ def split_fares(segment_costs: List[int], passengers) -> Tuple[Dict, List[dict]]
     return totals, details
 
 
+# --- revision impact: average marginal contribution of each cost change
+
+
+def revision_impact(segment_costs: List[int], revised_costs: List[int],
+                    passengers) -> Tuple[Dict, Dict, Dict, List[dict]]:
+    """Attribute a per-segment cost revision to the individual changed segments.
+
+    ``segment_costs`` and ``revised_costs`` are the segment costs before and
+    after a revision; they must have equal length and may differ in at most
+    8 positions (both enforced by request validation). Every position whose
+    cost differs is one *change*. Applying a subset of the changes yields a
+    hybrid cost vector whose per-passenger totals are computed with
+    :func:`split_fares` — the same cumulative-deficit allocation as
+    ``/split``.
+
+    A change's impact on a passenger is its average marginal contribution
+    over every order in which the changes could be applied (its Shapley
+    value): for each subset ``S`` of the other changes, the marginal effect
+    ``totals(S + change) - totals(S)`` is weighted by the number of
+    permutations in which exactly ``S`` precedes the change,
+    ``|S|! (k - |S| - 1)!`` out of ``k!`` total. Along any single order the
+    marginal effects of all changes telescope to ``totals(all) -
+    totals(none)``, so each passenger's per-change impacts sum exactly to
+    their before/after difference.
+
+    Returns ``(before, after, difference, contributions)``: ``before`` and
+    ``after`` map passenger id -> cents owed under the original and revised
+    costs (canonical id order), ``difference`` maps id -> ``after - before``
+    (signed), and ``contributions`` is a per-changed-segment list of dicts
+    with keys ``index``, ``original_cost``, ``revised_cost`` and ``shares``
+    (id -> exact :class:`Fraction` impact; negative when the change lowers
+    the passenger's fare). With no changes the list is empty and every
+    difference is zero.
+    """
+    changed = [
+        i for i, (old, new) in enumerate(zip(segment_costs, revised_costs))
+        if old != new
+    ]
+    k = len(changed)
+
+    # Per-passenger totals for every subset of the changes; bit j of the
+    # mask means change `changed[j]` is applied.
+    totals_for: List[Dict] = []
+    for mask in range(1 << k):
+        costs = list(segment_costs)
+        for j in range(k):
+            if mask & (1 << j):
+                costs[changed[j]] = revised_costs[changed[j]]
+        totals, _ = split_fares(costs, passengers)
+        totals_for.append(totals)
+
+    before = totals_for[0]
+    after = totals_for[(1 << k) - 1]
+    difference = {pid: after[pid] - before[pid] for pid in before}
+
+    if k == 0:
+        return before, after, difference, []
+
+    factorial = [1]
+    for m in range(1, k + 1):
+        factorial.append(factorial[-1] * m)
+
+    contributions: List[dict] = []
+    for j, index in enumerate(changed):
+        bit = 1 << j
+        shares = {pid: Fraction(0) for pid in before}
+        for mask in range(1 << k):
+            if mask & bit:
+                continue
+            # Permutations in which exactly this subset precedes the change.
+            s = mask.bit_count()
+            weight = Fraction(factorial[s] * factorial[k - 1 - s], factorial[k])
+            with_change = totals_for[mask | bit]
+            without_change = totals_for[mask]
+            for pid in shares:
+                shares[pid] += weight * (with_change[pid] - without_change[pid])
+        contributions.append({
+            "index": index,
+            "original_cost": segment_costs[index],
+            "revised_cost": revised_costs[index],
+            "shares": shares,
+        })
+    return before, after, difference, contributions
+
+
 # --- admission: pick the best feasible subset of candidate passengers
 
 

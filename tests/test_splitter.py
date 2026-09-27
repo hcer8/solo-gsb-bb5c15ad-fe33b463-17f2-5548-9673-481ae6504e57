@@ -6,9 +6,16 @@ as well as under pytest.
 
 import random
 import unittest
+from fractions import Fraction
 from types import SimpleNamespace as P
 
-from app.splitter import _triple, admit_passengers, settle_balances, split_fares
+from app.splitter import (
+    _triple,
+    admit_passengers,
+    revision_impact,
+    settle_balances,
+    split_fares,
+)
 
 
 def ride(pid, board, alight):
@@ -228,6 +235,127 @@ class AdmitPassengersTests(unittest.TestCase):
         ref_totals, ref_details = split_fares([100, 251, 80], chosen)
         self.assertEqual(totals, ref_totals)
         self.assertEqual(details, ref_details)
+
+
+class RevisionImpactTests(unittest.TestCase):
+    def test_no_changes_means_empty_contributions_and_zero_difference(self):
+        passengers = [ride("a", 0, 2), ride("b", 0, 1)]
+        before, after, difference, contributions = revision_impact(
+            [100, 50], [100, 50], passengers
+        )
+        self.assertEqual(before, after)
+        self.assertEqual(before, {"a": 100, "b": 50})
+        self.assertEqual(difference, {"a": 0, "b": 0})
+        self.assertEqual(contributions, [])
+
+    def test_single_change_gets_the_whole_difference(self):
+        passengers = [ride("a", 0, 1), ride("b", 0, 1)]
+        before, after, difference, contributions = revision_impact(
+            [100], [141], passengers
+        )
+        self.assertEqual(before, {"a": 50, "b": 50})
+        self.assertEqual(after, {"a": 71, "b": 70})
+        self.assertEqual(difference, {"a": 21, "b": 20})
+        self.assertEqual(len(contributions), 1)
+        self.assertEqual(contributions[0]["index"], 0)
+        self.assertEqual(contributions[0]["original_cost"], 100)
+        self.assertEqual(contributions[0]["revised_cost"], 141)
+        self.assertEqual(
+            contributions[0]["shares"], {"a": Fraction(21), "b": Fraction(20)}
+        )
+
+    def test_two_changes_share_the_deficit_interaction(self):
+        # [10,10] -> [11,11], both ride both segments. Applying only one
+        # change gives alice the odd cent (id tie-break); applying both
+        # gives bob the second segment's cent. Each change's average
+        # marginal impact is therefore 1/2 per passenger.
+        passengers = [ride("alice", 0, 2), ride("bob", 0, 2)]
+        before, after, difference, contributions = revision_impact(
+            [10, 10], [11, 11], passengers
+        )
+        self.assertEqual(before, {"alice": 10, "bob": 10})
+        self.assertEqual(after, {"alice": 11, "bob": 11})
+        self.assertEqual(difference, {"alice": 1, "bob": 1})
+        self.assertEqual([c["index"] for c in contributions], [0, 1])
+        for c in contributions:
+            self.assertEqual(
+                c["shares"], {"alice": Fraction(1, 2), "bob": Fraction(1, 2)}
+            )
+
+    def test_negative_contributions_keep_their_sign(self):
+        passengers = [ride("a", 0, 1), ride("b", 0, 1)]
+        _, _, difference, contributions = revision_impact([100], [60], passengers)
+        self.assertEqual(difference, {"a": -20, "b": -20})
+        self.assertEqual(
+            contributions[0]["shares"], {"a": Fraction(-20), "b": Fraction(-20)}
+        )
+
+    def test_worked_example_matches_hand_computation(self):
+        # segments [100,251,80] -> [101,252,79]: three changes, worked out
+        # subset by subset (weights 1/3, 1/6, 1/6, 1/3 for k = 3).
+        passengers = [ride("alice", 0, 3), ride("bob", 1, 3), ride("carol", 0, 1)]
+        before, after, difference, contributions = revision_impact(
+            [100, 251, 80], [101, 252, 79], passengers
+        )
+        self.assertEqual(before, {"alice": 216, "bob": 165, "carol": 50})
+        self.assertEqual(after, {"alice": 216, "bob": 166, "carol": 50})
+        self.assertEqual(difference, {"alice": 0, "bob": 1, "carol": 0})
+        self.assertEqual(
+            [(c["index"], c["original_cost"], c["revised_cost"])
+             for c in contributions],
+            [(0, 100, 101), (1, 251, 252), (2, 80, 79)],
+        )
+        self.assertEqual(
+            [c["shares"] for c in contributions],
+            [
+                {"alice": Fraction(1, 3), "bob": Fraction(2, 3), "carol": Fraction(0)},
+                {"alice": Fraction(1, 3), "bob": Fraction(2, 3), "carol": Fraction(0)},
+                {"alice": Fraction(-2, 3), "bob": Fraction(-1, 3), "carol": Fraction(0)},
+            ],
+        )
+
+    def test_input_order_does_not_matter(self):
+        passengers = [ride("a", 0, 3), ride("b", 1, 3), ride("c", 0, 1)]
+        baseline = revision_impact([100, 251, 80], [101, 252, 79], passengers)
+        for seed in range(5):
+            shuffled = passengers[:]
+            random.Random(seed).shuffle(shuffled)
+            self.assertEqual(
+                revision_impact([100, 251, 80], [101, 252, 79], shuffled),
+                baseline,
+            )
+
+    def test_contributions_sum_to_difference_and_match_plain_splits(self):
+        rng = random.Random(20260926)
+        for _ in range(80):
+            n_seg = rng.randint(1, 6)
+            segments = [rng.randint(0, 300) for _ in range(n_seg)]
+            revised = [rng.randint(0, 300) for _ in range(n_seg)]
+            passengers = [ride("anchor", 0, n_seg)]  # covers every segment
+            for i in range(rng.randint(0, 4)):
+                board = rng.randint(0, n_seg - 1)
+                alight = rng.randint(board + 1, n_seg)
+                passengers.append(ride(f"p{i}", board, alight))
+
+            before, after, difference, contributions = revision_impact(
+                segments, revised, passengers
+            )
+
+            changed = [i for i in range(n_seg) if segments[i] != revised[i]]
+            self.assertEqual([c["index"] for c in contributions], changed)
+            for c in contributions:
+                self.assertEqual(c["original_cost"], segments[c["index"]])
+                self.assertEqual(c["revised_cost"], revised[c["index"]])
+            # before/after are exactly the plain splits of the two vectors
+            self.assertEqual(before, split_fares(segments, passengers)[0])
+            self.assertEqual(after, split_fares(revised, passengers)[0])
+            # per passenger the contributions sum exactly to the difference
+            for pid in difference:
+                self.assertEqual(
+                    sum((c["shares"][pid] for c in contributions), Fraction(0)),
+                    difference[pid],
+                )
+                self.assertEqual(difference[pid], after[pid] - before[pid])
 
 
 class SettleBalancesTests(unittest.TestCase):

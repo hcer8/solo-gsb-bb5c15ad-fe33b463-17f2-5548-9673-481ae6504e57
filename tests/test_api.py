@@ -23,6 +23,8 @@ SETTLE_PAYLOAD = dict(PAYLOAD, payments=[
     {"id": "carol", "amount": 0},
 ])
 
+REVISION_PAYLOAD = dict(PAYLOAD, revised_segments=[101, 252, 79])
+
 
 class SplitApiTests(unittest.TestCase):
     def test_split_ok(self):
@@ -486,6 +488,123 @@ class SettleApiTests(unittest.TestCase):
         resp = client.get("/healthz")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"status": "ok"})
+
+
+class RevisionImpactApiTests(unittest.TestCase):
+    def test_revision_impact_ok(self):
+        resp = client.post("/revision-impact", json=REVISION_PAYLOAD)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["changed_segments"], [0, 1, 2])
+        self.assertEqual(body["before"], {"alice": 216, "bob": 165, "carol": 50})
+        self.assertEqual(body["after"], {"alice": 216, "bob": 166, "carol": 50})
+        self.assertEqual(body["difference"], {"alice": 0, "bob": 1, "carol": 0})
+        self.assertEqual(body["contributions"], [
+            {"index": 0, "original_cost": 100, "revised_cost": 101,
+             "shares": {"alice": "1/3", "bob": "2/3", "carol": "0"}},
+            {"index": 1, "original_cost": 251, "revised_cost": 252,
+             "shares": {"alice": "1/3", "bob": "2/3", "carol": "0"}},
+            {"index": 2, "original_cost": 80, "revised_cost": 79,
+             "shares": {"alice": "-2/3", "bob": "-1/3", "carol": "0"}},
+        ])
+
+    def test_contributions_sum_exactly_to_difference(self):
+        from fractions import Fraction
+        resp = client.post("/revision-impact", json=REVISION_PAYLOAD)
+        body = resp.json()
+        for pid, diff in body["difference"].items():
+            total = sum(Fraction(c["shares"][pid]) for c in body["contributions"])
+            self.assertEqual(total, diff, pid)
+
+    def test_no_changes_returns_empty_contributions_and_zero_difference(self):
+        payload = dict(PAYLOAD, revised_segments=list(PAYLOAD["segments"]))
+        resp = client.post("/revision-impact", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["changed_segments"], [])
+        self.assertEqual(body["contributions"], [])
+        self.assertEqual(body["before"], body["after"])
+        self.assertEqual(body["difference"], {"alice": 0, "bob": 0, "carol": 0})
+
+    def test_before_and_after_match_split_totals(self):
+        body = client.post("/revision-impact", json=REVISION_PAYLOAD).json()
+        before = client.post("/split", json=PAYLOAD).json()["totals"]
+        after = client.post("/split", json=dict(
+            PAYLOAD, segments=REVISION_PAYLOAD["revised_segments"]
+        )).json()["totals"]
+        self.assertEqual(body["before"], before)
+        self.assertEqual(body["after"], after)
+
+    def test_passenger_order_does_not_matter(self):
+        reversed_payload = dict(
+            REVISION_PAYLOAD, passengers=list(reversed(PAYLOAD["passengers"]))
+        )
+        r1 = client.post("/revision-impact", json=REVISION_PAYLOAD)
+        r2 = client.post("/revision-impact", json=reversed_payload)
+        self.assertEqual(r1.status_code, r2.status_code)
+        self.assertEqual(r1.json(), r2.json())
+
+    def test_more_than_8_changed_segments_is_422(self):
+        payload = {
+            "segments": [100] * 9,
+            "revised_segments": [101] * 9,
+            "passengers": [{"id": "a", "board": 0, "alight": 9}],
+        }
+        resp = client.post("/revision-impact", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("at most 8", resp.text)
+
+    def test_exactly_8_changed_segments_is_ok(self):
+        payload = {
+            "segments": [100] * 8,
+            "revised_segments": [101] * 8,
+            "passengers": [{"id": "a", "board": 0, "alight": 8}],
+        }
+        resp = client.post("/revision-impact", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["changed_segments"], list(range(8)))
+        self.assertEqual(body["difference"], {"a": 8})
+        # a single rider absorbs each +1 change entirely
+        for c in body["contributions"]:
+            self.assertEqual(c["shares"], {"a": "1"})
+
+    def test_length_mismatch_is_422(self):
+        payload = dict(PAYLOAD, revised_segments=[100, 251])
+        resp = client.post("/revision-impact", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("same length", resp.text)
+
+    def test_missing_revised_segments_is_422(self):
+        self.assertEqual(
+            client.post("/revision-impact", json=PAYLOAD).status_code, 422
+        )
+
+    def test_revised_empty_load_charged_segment_is_422(self):
+        payload = {
+            "segments": [0, 50],
+            "revised_segments": [10, 50],
+            "passengers": [{"id": "a", "board": 1, "alight": 2}],
+        }
+        resp = client.post("/revision-impact", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("no passengers on board", resp.text)
+
+    def test_trip_rules_still_apply(self):
+        payload = dict(
+            REVISION_PAYLOAD,
+            passengers=[{"id": "a", "board": 0, "alight": 3},
+                        {"id": "a", "board": 0, "alight": 3}],
+        )
+        resp = client.post("/revision-impact", json=payload)
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("duplicate passenger id", resp.text)
+
+    def test_unknown_field_is_422(self):
+        payload = dict(REVISION_PAYLOAD, currency="usd")
+        self.assertEqual(
+            client.post("/revision-impact", json=payload).status_code, 422
+        )
 
 
 if __name__ == "__main__":
